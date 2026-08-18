@@ -384,6 +384,220 @@ class SchedulerTests(TestCase):
                 assert mock_job.call_count == 0
                 assert len(schedule.jobs) == 0
 
+    def test_during_window_parsing(self):
+        mock_job = make_mock_job()
+
+        job = every().minute.during("10:00", "14:00").do(mock_job)
+        assert job.during_start == datetime.time(10, 0)
+        assert job.during_end == datetime.time(14, 0)
+        assert job.during_zone is None
+
+        job = every().minute.during("10:00:30", "14:00:45").do(mock_job)
+        assert job.during_start == datetime.time(10, 0, 30)
+        assert job.during_end == datetime.time(14, 0, 45)
+
+        job = every().minute.during(
+            datetime.time(9, 30), datetime.time(17, 0)
+        ).do(mock_job)
+        assert job.during_start == datetime.time(9, 30)
+        assert job.during_end == datetime.time(17, 0)
+
+        job = every().minute.during("10:00", "14:00", tz="UTC").do(mock_job)
+        assert job.during_zone == ZoneInfo("UTC")
+
+        job = every().minute.during(
+            "10:00", "14:00", tz=ZoneInfo("Europe/Amsterdam")
+        ).do(mock_job)
+        assert job.during_zone == ZoneInfo("Europe/Amsterdam")
+
+        job = every().minute.during("22:00", "06:00").do(mock_job)
+        assert job.during_start == datetime.time(22, 0)
+        assert job.during_end == datetime.time(6, 0)
+
+    def test_during_window_validation(self):
+        self.assertRaises(
+            TypeError, every().minute.during, 123, "14:00"
+        )
+        self.assertRaises(
+            TypeError, every().minute.during, "10:00", 123
+        )
+        self.assertRaises(
+            ScheduleValueError, every().minute.during, "bad", "14:00"
+        )
+        self.assertRaises(
+            ScheduleValueError, every().minute.during, "10:00", "bad"
+        )
+        self.assertRaises(
+            ScheduleValueError, every().minute.during, "10:00", "10:00"
+        )
+        self.assertRaises(
+            ScheduleValueError, every().minute.during, "10:00", "14:00", tz=123
+        )
+
+    def test_during_window_basic(self):
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 9, 30, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 10, 0, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 15, 0, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 2, 10, 0, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 12, 0, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 12, 1, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 10, 0, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 10, 1, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 9, 59, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 10, 0, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 14, 0, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 2, 10, 0, 0)
+
+    def test_during_window_run_pending(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 9, 59, 0):
+            every().minute.during("10:00", "14:00").do(mock_job)
+
+        for hour in (10, 11, 12, 13):
+            for minute in range(0, 60):
+                with mock_datetime(2024, 6, 1, hour, minute, 0):
+                    schedule.run_pending()
+        expected_runs = 4 * 60
+        assert mock_job.call_count == expected_runs
+
+        with mock_datetime(2024, 6, 1, 14, 0, 0):
+            schedule.run_pending()
+        assert mock_job.call_count == expected_runs
+
+        with mock_datetime(2024, 6, 1, 14, 30, 0):
+            schedule.run_pending()
+        assert mock_job.call_count == expected_runs
+
+        with mock_datetime(2024, 6, 2, 10, 0, 0):
+            schedule.run_pending()
+        assert mock_job.call_count == expected_runs + 1
+
+    def test_during_window_wrap(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 14, 0, 0):
+            job = every().minute.during("22:00", "06:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 22, 0, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 23, 0, 0):
+            job = every().minute.during("22:00", "06:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 23, 1, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 4, 0, 0):
+            job = every().minute.during("22:00", "06:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 4, 1, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 7, 0, 0):
+            job = every().minute.during("22:00", "06:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 22, 0, 0)
+
+    def test_during_window_combined_with_to(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 9, 59, 0):
+            job = every(1).to(5).minutes.during("10:00", "14:00").do(mock_job)
+            assert job.next_run >= datetime.datetime(2024, 6, 1, 10, 0, 0)
+            assert job.next_run <= datetime.datetime(2024, 6, 1, 10, 5, 0)
+
+    def test_during_window_combined_with_until(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 9, 0, 0):
+            every().minute.during("10:00", "14:00").until(
+                datetime.datetime(2024, 6, 2, 12, 0, 0)
+            ).do(mock_job)
+            assert len(schedule.jobs) == 1
+
+        with mock_datetime(2024, 6, 2, 13, 0, 0):
+            schedule.run_pending()
+            assert mock_job.call_count == 0
+            assert len(schedule.jobs) == 0
+
+    def test_during_window_repr(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 12, 0, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            r = repr(job)
+            assert "during" in r
+            assert "10:00:00" in r
+            assert "14:00:00" in r
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 12, 0, 0):
+            job = every().minute.during("10:00", "14:00", tz="UTC").do(mock_job)
+            assert "UTC" in repr(job)
+
+    def test_during_window_with_timezone(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 12, 30, 0, zone=TZ_UTC):
+            job = every().minute.during("12:00", "13:00", tz="UTC").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 12, 31, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 14, 0, 0, zone=TZ_UTC):
+            job = every().minute.during("12:00", "13:00", tz="UTC").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 2, 12, 0, 0)
+
+        schedule.clear()
+
+        with mock_datetime(2024, 6, 1, 14, 0, 0, zone=TZ_UTC):
+            job_utc = every().minute.during("12:00", "13:00", tz="UTC").do(
+                mock_job
+            )
+            assert job_utc.next_run == datetime.datetime(2024, 6, 2, 12, 0, 0)
+
+    def test_during_window_skips_when_far_behind(self):
+        schedule.clear()
+        mock_job = make_mock_job()
+
+        with mock_datetime(2024, 6, 1, 9, 0, 0):
+            job = every().minute.during("10:00", "14:00").do(mock_job)
+            assert job.next_run == datetime.datetime(2024, 6, 1, 10, 0, 0)
+
+        with mock_datetime(2024, 6, 1, 15, 0, 0):
+            job._schedule_next_run()
+            assert job.next_run == datetime.datetime(2024, 6, 2, 10, 0, 0)
+
     def test_weekday_at_todady(self):
         mock_job = make_mock_job()
 

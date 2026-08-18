@@ -252,6 +252,10 @@ class Job:
         # optional time of final run
         self.cancel_after: Optional[datetime.datetime] = None
 
+        self.during_start: Optional[datetime.time] = None
+        self.during_end: Optional[datetime.time] = None
+        self.during_zone: Optional[ZoneInfo] = None
+
         self.tags: Set[Hashable] = set()  # unique set of tags for the job
         self.scheduler: Optional[Scheduler] = scheduler  # scheduler to register with
 
@@ -309,10 +313,20 @@ class Job:
                 timestats,
             )
         else:
+            during_clause = ""
+            if self.during_start is not None:
+                zone = " " + str(self.during_zone) if self.during_zone else ""
+                during_clause = " during [%s, %s)%s" % (
+                    self.during_start,
+                    self.during_end,
+                    zone,
+                )
             fmt = (
                 "Every %(interval)s "
                 + ("to %(latest)s " if self.latest is not None else "")
-                + "%(unit)s do %(call_repr)s %(timestats)s"
+                + "%(unit)s"
+                + during_clause
+                + " do %(call_repr)s %(timestats)s"
             )
 
             return fmt % dict(
@@ -572,6 +586,68 @@ class Job:
         self.latest = latest
         return self
 
+    def during(
+        self,
+        start: Union[datetime.time, str],
+        end: Union[datetime.time, str],
+        tz: Optional[Union[str, ZoneInfo]] = None,
+    ):
+        """
+        Schedule the job to run only during a daily time-of-day window.
+
+        The window is start-inclusive, end-exclusive, and repeats every day.
+        Wrap is allowed: when `start > end`, the window crosses midnight
+        (e.g. `during("22:00", "06:00")` runs 22:00–05:59).
+
+        :param start: Lower bound, a ``datetime.time`` or ``"HH:MM[:SS]"`` string.
+        :param end: Upper bound (exclusive). Same accepted types as ``start``.
+        :param tz: Optional timezone for the window — string or ``ZoneInfo``.
+            Defaults to local.
+        :return: The invoked job instance
+        """
+        if self.unit not in ("seconds", "minutes", "hours", "days") and not self.start_day:
+            raise ScheduleValueError(
+                "during() requires the unit to be `seconds`, `minutes`, "
+                "`hours`, or `days` (or a weekday)."
+            )
+
+        self.during_start = self._parse_time_of_day(start, "start")
+        self.during_end = self._parse_time_of_day(end, "end")
+        if self.during_start == self.during_end:
+            raise ScheduleValueError("during() start and end must differ")
+
+        if tz is not None:
+            if isinstance(tz, str):
+                self.during_zone = ZoneInfo(tz)  # type: ignore
+            elif isinstance(tz, ZoneInfo):
+                self.during_zone = tz
+            else:
+                raise ScheduleValueError(
+                    "during() tz must be a string or ZoneInfo object"
+                )
+        return self
+
+    @staticmethod
+    def _parse_time_of_day(
+        value: Union[datetime.time, str], label: str
+    ) -> datetime.time:
+        if isinstance(value, datetime.time):
+            return value
+        if isinstance(value, str):
+            if not re.match(r"^([0-1]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$", value):
+                raise ScheduleValueError(
+                    "Invalid time format for during() {} "
+                    "(valid format is HH:MM or HH:MM:SS)".format(label)
+                )
+            parts = value.split(":")
+            hour, minute = int(parts[0]), int(parts[1])
+            second = int(parts[2]) if len(parts) == 3 else 0
+            return datetime.time(hour, minute, second)
+        raise TypeError(
+            "during() {} must be a string ('HH:MM' or 'HH:MM:SS') "
+            "or a datetime.time".format(label)
+        )
+
     def until(
         self,
         until_time: Union[datetime.datetime, datetime.timedelta, datetime.time, str],
@@ -712,8 +788,8 @@ class Job:
         else:
             interval = self.interval
 
-        # Do all computation in the context of the requested timezone
-        now = datetime.datetime.now(self.at_time_zone)
+        zone = self.during_zone if self.during_zone is not None else self.at_time_zone
+        now = datetime.datetime.now(zone)
 
         next_run = now
 
@@ -729,20 +805,51 @@ class Job:
         if interval != 1:
             next_run += period
 
+        if self.during_start is not None:
+            next_run = self._next_in_during_window(next_run)
+
         while next_run <= now:
             next_run += period
+            if self.during_start is not None:
+                next_run = self._next_in_during_window(next_run)
 
         next_run = self._correct_utc_offset(next_run)
 
         # To keep the api consistent with older versions, we have to set the 'next_run' to a naive timestamp in the local timezone.
         # Because we want to stay backwards compatible with older versions.
-        if self.at_time_zone is not None:
-            # Convert back to the local timezone
-            next_run = next_run.astimezone()
-
-            next_run = next_run.replace(tzinfo=None)
+        if self.at_time_zone is not None or self.during_zone is not None:
+            next_run = next_run.astimezone().replace(tzinfo=None)
 
         self.next_run = next_run
+
+    def _next_in_during_window(self, candidate: datetime.datetime) -> datetime.datetime:
+        if self.during_start is None:
+            return candidate
+
+        if self.during_zone is not None:
+            local = candidate.astimezone(self.during_zone)
+        else:
+            local = candidate
+
+        start, end = self.during_start, self.during_end
+        assert end is not None
+        tod = local.time().replace(microsecond=0)
+        if _time_in_window(tod, start, end):
+            return candidate
+
+        days = 0 if start > tod else 1
+        new_local = (local + datetime.timedelta(days=days)).replace(
+            hour=start.hour,
+            minute=start.minute,
+            second=start.second,
+            microsecond=0,
+        )
+
+        if self.during_zone is not None:
+            new_local = new_local.astimezone(
+                datetime.timezone.utc
+            ).astimezone(self.during_zone)
+        return new_local
 
     def _move_to_at_time(self, moment: datetime.datetime) -> datetime.datetime:
         """
@@ -903,3 +1010,12 @@ def _weekday_index(day: str) -> int:
             "Invalid start day (valid start days are {})".format(weekdays)
         )
     return weekdays.index(day)
+
+
+def _time_in_window(
+    tod: datetime.time, start: datetime.time, end: datetime.time
+) -> bool:
+    tod = tod.replace(microsecond=0)
+    if start <= end:
+        return start <= tod < end
+    return tod >= start or tod < end
